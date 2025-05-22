@@ -77,7 +77,7 @@ class DNASeqRecognition(Adapter):
 
 
 class DNASequenceWithCRFAdapter(Adapter):
-    __provider__ = 'dna_seq_crf_torch_struct'
+    __provider__ = 'dna_seq_crf_beam_search'
 
     @classmethod
     def parameters(cls):
