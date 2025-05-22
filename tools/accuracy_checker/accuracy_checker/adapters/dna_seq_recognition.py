@@ -75,89 +75,81 @@ class DNASeqRecognition(Adapter):
         super().select_output_blob(outputs)
         return
 
+
 class DNASequenceWithCRFAdapter(Adapter):
-    __provider__ = 'dna_seq_crf_beam_search'
+    __provider__ = 'dna_seq_crf_torch_struct'
 
     @classmethod
     def parameters(cls):
         params = super().parameters()
         params.update({
-            'output_blob': StringField(optional=True, description='name of output layer')
+            'output_blob': StringField(
+                optional=True, description='name of output layer'
+            ),
+            'beam_size': NumberField(
+                optional=True, default=1,
+                description='number of top sequences to return'
+            )
         })
         return params
 
     def configure(self):
+        # torch is required
         try:
-            import torch  # pylint: disable=import-outside-toplevel
+            import torch  # noqa
             self._torch = torch
-        except ImportError as torch_import_error:
-            UnsupportedPackage('torch', torch_import_error.msg).raise_error(self.__provider__)
+        except ImportError as e:
+            UnsupportedPackage('torch', str(e)).raise_error(self.__provider__)
+
+        # torch-struct LinearChainCRF is our new CRF decoder
         try:
-            from crf_beam import beam_search as crf_beam_search  # pylint: disable=import-outside-toplevel
-            self._crf_beam_search = crf_beam_search
-        except ImportError as crf_beam_import_error:
-            UnsupportedPackage('crf_beam', crf_beam_import_error.msg).raise_error(self.__provider__)
+            from torch_struct import LinearChainCRF  # noqa
+            self._CRF = LinearChainCRF
+        except ImportError as e:
+            UnsupportedPackage('torch-struct', str(e)).raise_error(self.__provider__)
+
         if not self.label_map:
-            raise ConfigError('Beam Search Decoder requires dataset label map for correct decoding.')
-        alphabet = list(self.label_map.values())
+            raise ConfigError(
+                'Beam Search Decoder requires dataset label map for correct decoding.'
+            )
+        self.state_len = len(self.label_map)
         self.output_blob = self.get_value_from_config('output_blob')
         self.output_verified = False
-        self.state_len = len(alphabet)
-        self.n_base = self.state_len - 1
-        semiring = namedtuple('semiring', ('zero', 'one', 'mul', 'sum', 'dsum'))
-        self.log_semiring = semiring(zero=-1e38, one=0., mul=self._torch.add, sum=self._torch.logsumexp,
-            dsum=self._torch.softmax)
-        self.idx = self._torch.cat([
-            self._torch.arange(self.n_base ** (self.state_len))[:, None],
-            self._torch.arange(
-                self.n_base ** (self.state_len)
-            ).repeat_interleave(self.n_base).reshape(self.n_base, -1).T
-        ], dim=1).to(self._torch.int32)
 
     def process(self, raw, identifiers, frame_meta):
         raw_outputs = self._extract_predictions(raw, frame_meta)
         if not self.output_verified:
             self.select_output_blob(raw_outputs)
+
+        # raw_outputs[self.output_blob] should be shape (T, N, S)
+        scores = self._torch.from_numpy(raw_outputs[self.output_blob])
+        T, N, S = scores.shape
+
+        # transpose to (N, T, S)
+        emissions = scores.transpose(0, 1)
+
+        # build zero transitions: shape (N, T, S, S)
+        transitions = emissions.new_zeros((N, T, S, S))
+        log_potentials = transitions + emissions[:, :, None, :]
+
+        # instantiate CRF distribution
+        dist = self._CRF(log_potentials)
+
+        # decode top-K sequences
+        K = int(self.get_value_from_config('beam_size'))
+        topk_seqs = dist.topk(K)
+
+        # return the best (0-th) path for each sample
         result = []
-        scores =  self._torch.from_numpy(raw_outputs[self.output_blob])
-        fwd_scores = self.forward_scores(scores)
-        bwd_scores = self.backward_scores(scores)
-        posts = self._torch.softmax(fwd_scores + bwd_scores, dim=-1)
-        scores = scores.transpose(0, 1)
-        bwds = bwd_scores.transpose(0, 1)
-        posts = posts.transpose(0, 1)
-        for identifier, score,  bwd, post in zip(identifiers, scores, bwds, posts):
-            seq, _, _ = self._crf_beam_search(score, bwd, post)
-            result.append(DNASequencePrediction(identifier, seq))
+        for batch_idx, identifier in enumerate(identifiers):
+            best_seq = topk_seqs[0, batch_idx].tolist()
+            result.append(DNASequencePrediction(identifier, best_seq))
+
         return result
-
-    @staticmethod
-    def scan(ms, idx, v0, s):
-        t, n, c, _ = ms.shape
-        alpha = ms.new_full((t + 1, n, c), s.zero)
-        alpha[0] = v0
-        for t_ in range(t):
-            alpha[t_ + 1] = s.sum(s.mul(ms[t_], alpha[t_, :, idx]), dim=-1)
-        return alpha
-
-    def forward_scores(self, scores):
-        t, n, _ = scores.shape
-        ms = scores.reshape(t, n, -1, self.n_base + 1)
-        v0 = ms.new_full((n, self.n_base ** (self.state_len)), self.log_semiring.one)
-        return self.scan(ms, self.idx.to(self._torch.int64), v0, self.log_semiring)
-
-    def backward_scores(self, scores):
-        _, n, _ = scores.shape
-        vt = scores.new_full((n, self.n_base**(self.state_len)), self.log_semiring.one)
-        idx_t = self.idx.flatten().argsort().reshape(*self.idx.shape)
-        ms_t = scores[:, :, idx_t]
-        idx_t = self._torch.div(idx_t, self.n_base + 1, rounding_mode='floor')
-        return self.scan(ms_t.flip(0), idx_t.to(self._torch.int64), vt, self.log_semiring).flip(0)
 
     def select_output_blob(self, outputs):
         self.output_verified = True
         if self.output_blob:
             self.output_blob = self.check_output_name(self.output_blob, outputs)
-            return
-        super().select_output_blob(outputs)
-        return
+        else:
+            super().select_output_blob(outputs)
